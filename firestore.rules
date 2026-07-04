@@ -1,0 +1,124 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- Helper functions ----------
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function myUserDoc() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function myRole() {
+      return myUserDoc().data.role;
+    }
+
+    function myCompanyId() {
+      return myUserDoc().data.companyId;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && myRole() == 'admin';
+    }
+
+    function isManagerOrAbove() {
+      return isSignedIn() && (myRole() == 'admin' || myRole() == 'manager');
+    }
+
+    function isSupervisorOrAbove() {
+      return isSignedIn() && (myRole() == 'admin' || myRole() == 'manager' || myRole() == 'supervisor');
+    }
+
+    // True if the requesting user belongs to the same company as companyId.
+    function belongsToCompany(companyId) {
+      return isSignedIn() && myCompanyId() == companyId;
+    }
+
+    // ---------- users/{uid} ----------
+    // Each user can read/update their own profile.
+    // Admin/Manager of the SAME company can read & update users of that
+    // company (needed for role assignment, department/plant linkage).
+    match /users/{userId} {
+      allow create: if isSignedIn() && request.auth.uid == userId;
+
+      allow read: if isSignedIn() && (
+        request.auth.uid == userId ||
+        (isManagerOrAbove() && resource.data.companyId == myCompanyId())
+      );
+
+      // A user may update their own basic profile fields, OR an admin/manager
+      // of the same company may update role/companyId/department/plant
+      // assignment. We disallow a user from self-elevating their own role.
+      allow update: if isSignedIn() && (
+        (request.auth.uid == userId &&
+          request.resource.data.role == resource.data.role &&
+          request.resource.data.companyId == resource.data.companyId) ||
+        (isManagerOrAbove() &&
+          (resource.data.companyId == myCompanyId() ||
+           resource.data.companyId == null) &&
+          request.resource.data.companyId == myCompanyId())
+      );
+
+      allow delete: if isAdmin() && resource.data.companyId == myCompanyId();
+
+      // Needed so Admin/Manager can query users by companyId to build the
+      // "Users & Roles" screen. Firestore evaluates list queries against
+      // rules per-document, so the `read` rule above already covers list.
+    }
+
+    // ---------- companies/{companyId} ----------
+    // Any authenticated user can create a company (they become its admin).
+    // Only members of a company can read that company's own document.
+    // Only the company's admin can update it.
+    match /companies/{companyId} {
+      allow create: if isSignedIn() && request.resource.data.ownerId == request.auth.uid;
+
+      allow read: if belongsToCompany(companyId) || isAdmin();
+
+      allow update, delete: if isAdmin() && belongsToCompany(companyId);
+
+      // ---------- companies/{companyId}/departments/{deptId} ----------
+      match /departments/{deptId} {
+        allow read: if belongsToCompany(companyId);
+        allow create, update, delete: if isManagerOrAbove() && belongsToCompany(companyId);
+      }
+
+      // ---------- companies/{companyId}/plants/{plantId} ----------
+      match /plants/{plantId} {
+        allow read: if belongsToCompany(companyId);
+        allow create, update, delete: if isManagerOrAbove() && belongsToCompany(companyId);
+      }
+
+      // ---------- companies/{companyId}/breakdowns/{breakdownId} ----------
+      match /breakdowns/{breakdownId} {
+        // Anyone in the company can read (app-layer additionally filters
+        // "user" role to only their own assigned/reported items for UX,
+        // but we allow read here to keep rules simple & avoid
+        // permission-denied on list queries; sensitive data isn't exposed
+        // beyond company boundary).
+        allow read: if belongsToCompany(companyId);
+
+        // Any company member can report (create) a breakdown.
+        allow create: if belongsToCompany(companyId) &&
+                        request.resource.data.reportedBy == request.auth.uid &&
+                        request.resource.data.companyId == companyId;
+
+        // Supervisor and above can update status/assignment.
+        // The original reporter can also update their own report while it
+        // is still 'open' (e.g. fix a typo) but cannot change status.
+        allow update: if belongsToCompany(companyId) && (
+          isSupervisorOrAbove() ||
+          (resource.data.reportedBy == request.auth.uid &&
+            resource.data.status == 'open' &&
+            request.resource.data.status == 'open')
+        );
+
+        allow delete: if isManagerOrAbove() && belongsToCompany(companyId);
+      }
+    }
+  }
+}

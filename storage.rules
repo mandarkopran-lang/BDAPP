@@ -1,0 +1,35 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function myUserDoc() {
+      return firestore.get(/databases/(default)/documents/users/$(request.auth.uid));
+    }
+
+    function myCompanyId() {
+      return myUserDoc().data.companyId;
+    }
+
+    // companies/{companyId}/breakdowns/{breakdownId}/{imageId}
+    match /companies/{companyId}/breakdowns/{breakdownId}/{imageId} {
+      allow read: if isSignedIn() && myCompanyId() == companyId;
+
+      allow write: if isSignedIn() &&
+                     myCompanyId() == companyId &&
+                     request.resource.size < 10 * 1024 * 1024 && // max 10MB
+                     request.resource.contentType.matches('image/.*');
+
+      allow delete: if isSignedIn() && myCompanyId() == companyId;
+    }
+
+    // Deny everything else by default.
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
